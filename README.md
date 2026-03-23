@@ -1,8 +1,8 @@
 ---
 title: RTSS Diff Viewer
-emoji: CT
+emoji: "🔍"
 colorFrom: blue
-colorTo: cyan
+colorTo: indigo
 sdk: streamlit
 sdk_version: 1.55.0
 app_file: app.py
