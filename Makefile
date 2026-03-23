@@ -1,21 +1,47 @@
 PYTHON ?= python3
+UV ?= uv
+PYTHON_VERSION ?= 3.11
 VENV ?= .venv
 PIP := $(VENV)/bin/pip
+PYTEST := $(VENV)/bin/pytest
 STREAMLIT := $(VENV)/bin/streamlit
 
 SPACE ?= amithjkamath/rtssdiffviewer
 HF_REMOTE ?= hf
 DEPLOY_BRANCH ?= deploy
 
-.PHONY: install run fmt lint clean deploy-init deploy status
+.PHONY: check-uv venv install run test test-all fmt lint clean clean-venv clean-py deploy-init deploy status
+
+check-uv:
+	@command -v $(UV) >/dev/null 2>&1 || { \
+		echo "uv is required. Install from https://docs.astral.sh/uv/getting-started/installation/"; \
+		exit 1; \
+	}
+
+venv:
+	$(MAKE) check-uv
+	rm -rf $(VENV)
+	$(UV) venv --python $(PYTHON_VERSION) $(VENV)
 
 install:
-	$(PYTHON) -m venv $(VENV)
-	$(PIP) install --upgrade pip
-	$(PIP) install -r requirements.txt
+	$(MAKE) venv
+	$(UV) pip install --python $(VENV)/bin/python -r requirements.txt
+	$(UV) pip install --python $(VENV)/bin/python -e .
 
 run:
 	$(STREAMLIT) run app.py
+
+test:
+	@if [ -x "$(PYTEST)" ]; then \
+		$(PYTEST) -q; \
+	else \
+		echo "pytest is not installed in $(VENV). Run 'make install' first."; \
+		exit 1; \
+	fi
+
+test-all:
+	$(MAKE) install
+	$(MAKE) test
 
 fmt:
 	@echo "No formatter configured."
@@ -28,7 +54,16 @@ lint:
 	fi
 
 clean:
-	rm -rf $(VENV) __pycache__ src/rtssdiffviewer/__pycache__
+	$(MAKE) clean-venv
+	$(MAKE) clean-py
+
+clean-venv:
+	rm -rf $(VENV)
+
+clean-py:
+	find . -type d -name "__pycache__" -prune -exec rm -rf {} +
+	find . -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
+	rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov .ipynb_checkpoints
 
 deploy-init:
 	@if git remote | grep -q '^$(HF_REMOTE)$$'; then \
