@@ -21,7 +21,11 @@ fmt:
 	@echo "No formatter configured."
 
 lint:
-	$(VENV)/bin/python -m py_compile app.py src/rtssdiffviewer/*.py
+	@if [ -x "$(VENV)/bin/python" ]; then \
+		$(VENV)/bin/python -m py_compile app.py src/rtssdiffviewer/*.py; \
+	else \
+		$(PYTHON) -m py_compile app.py src/rtssdiffviewer/*.py; \
+	fi
 
 clean:
 	rm -rf $(VENV) __pycache__ src/rtssdiffviewer/__pycache__
