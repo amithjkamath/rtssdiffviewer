@@ -10,7 +10,7 @@ SPACE ?= amithjkamath/rtssdiffviewer
 HF_REMOTE ?= hf
 DEPLOY_BRANCH ?= deploy
 
-.PHONY: check-uv venv install run test test-all fmt lint clean clean-venv clean-py deploy-init deploy status
+.PHONY: check-uv venv install run test test-all fmt lint clean clean-venv clean-py deploy-init deploy deploy-now status
 
 check-uv:
 	@command -v $(UV) >/dev/null 2>&1 || { \
@@ -81,6 +81,12 @@ deploy-init:
 
 deploy:
 	bash deploy.sh $(SPACE)
+
+deploy-now:
+	$(MAKE) deploy-init
+	@git add -A && git commit -m "Deploy: $(shell date '+%Y-%m-%d %H:%M:%S')" || true
+	@git push $(HF_REMOTE) $(DEPLOY_BRANCH):main
+	@echo "Deployment complete. Space: https://huggingface.co/spaces/$(SPACE)"
 
 status:
 	@echo "Space URL: https://huggingface.co/spaces/$(SPACE)"

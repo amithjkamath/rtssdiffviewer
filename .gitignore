@@ -1,6 +1,16 @@
 __pycache__/
 *.pyc
+*.pyo
 .venv/
 .env
 .DS_Store
 .streamlit/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
