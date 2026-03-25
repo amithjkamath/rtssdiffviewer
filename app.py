@@ -21,6 +21,8 @@ from rtssdiffviewer.dcm_to_json import dcm_to_json  # noqa: E402
 from rtssdiffviewer.diff_core import (  # noqa: E402
     COMPONENT_KEYS,
     DEFAULT_VOLATILE_TAG_PREFIXES,
+    contour_diff_text,
+    get_contour_slices_structured,
     normalize_value,
     pretty_json_text,
     select_component,
@@ -49,6 +51,539 @@ def ensure_state() -> None:
     st.session_state.setdefault("left_json_raw", None)
     st.session_state.setdefault("right_json_raw", None)
     st.session_state.setdefault("batch_variants", {})
+    st.session_state.setdefault("pair_step", "Upload Pair")
+    st.session_state.setdefault("pair_diff_requested", False)
+    st.session_state.setdefault("pair_diff_sig", None)
+    st.session_state.setdefault("pair_focus_slice_z", None)
+    st.session_state.setdefault("axial_target_slice_z", None)
+    st.session_state.setdefault("contour_detail_target_slice_z", None)
+
+
+def _point_distance(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+    return sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
+
+
+def _greedy_point_matches(
+    left_points: list[tuple[float, float, float]],
+    right_points: list[tuple[float, float, float]],
+) -> list[tuple[int, int, float]]:
+    if not left_points or not right_points:
+        return []
+
+    candidates: list[tuple[float, int, int]] = []
+    for li, lp in enumerate(left_points):
+        for ri, rp in enumerate(right_points):
+            candidates.append((_point_distance(lp, rp), li, ri))
+    candidates.sort(key=lambda x: x[0])
+
+    used_left: set[int] = set()
+    used_right: set[int] = set()
+    matches: list[tuple[int, int, float]] = []
+    for dist, li, ri in candidates:
+        if li in used_left or ri in used_right:
+            continue
+        used_left.add(li)
+        used_right.add(ri)
+        matches.append((li, ri, dist))
+    return matches
+
+
+def _slice_point_counts(
+    left_rois: dict[str, list[tuple[float, float, float]]],
+    right_rois: dict[str, list[tuple[float, float, float]]],
+) -> tuple[int, int, list[tuple[float, float, float]], list[tuple[float, float, float]]]:
+    left_points = [p for pts in left_rois.values() for p in pts]
+    right_points = [p for pts in right_rois.values() for p in pts]
+    return len(left_points), len(right_points), left_points, right_points
+
+
+def _slice_match_metrics(
+    left_rois: dict[str, list[tuple[float, float, float]]],
+    right_rois: dict[str, list[tuple[float, float, float]]],
+    tolerance_mm: float,
+) -> dict[str, Any]:
+    left_count, right_count, left_points, right_points = _slice_point_counts(left_rois, right_rois)
+    matches = _greedy_point_matches(left_points, right_points)
+    matched_in_tol = sum(1 for _, _, dist in matches if dist <= tolerance_mm)
+    dice = (2.0 * matched_in_tol) / (left_count + right_count) if (left_count + right_count) > 0 else 1.0
+    mismatch_count = left_count + right_count - (2 * matched_in_tol)
+    count_delta = abs(left_count - right_count)
+
+    left_roi_names = set(left_rois.keys())
+    right_roi_names = set(right_rois.keys())
+    all_roi_names = sorted(left_roi_names | right_roi_names)
+    identical_slice = left_roi_names == right_roi_names and all(
+        sorted(left_rois.get(roi, [])) == sorted(right_rois.get(roi, []))
+        for roi in all_roi_names
+    )
+
+    return {
+        "left_count": left_count,
+        "right_count": right_count,
+        "dice": dice,
+        "mismatch_count": mismatch_count,
+        "count_delta": count_delta,
+        "left_roi_names": left_roi_names,
+        "right_roi_names": right_roi_names,
+        "all_roi_names": all_roi_names,
+        "identical_slice": identical_slice,
+    }
+
+
+def _safe_key_fragment(value: str) -> str:
+    out = []
+    for ch in value:
+        out.append(ch if ch.isalnum() else "_")
+    return "".join(out)
+
+
+def _nearest_slice_value(slices: list[float], target: float | None) -> float | None:
+    if not slices:
+        return None
+    if target is None:
+        return slices[0]
+    return min(slices, key=lambda z: (abs(z - target), z))
+
+
+def _step_slice_value(slices: list[float], current: float, step: int) -> float:
+    if not slices:
+        return current
+    try:
+        idx = slices.index(current)
+    except ValueError:
+        idx = 0
+    next_idx = max(0, min(len(slices) - 1, idx + step))
+    return slices[next_idx]
+
+
+def _format_slice_rois_text(rois: dict[str, list[tuple[float, float, float]]], precision: int) -> str:
+    if not rois:
+        return "(no contours on this slice)"
+
+    lines: list[str] = []
+    for roi_name in sorted(rois.keys()):
+        points = rois[roi_name]
+        lines.append(f"{roi_name}: {len(points)} points")
+        for i, (x, y, z) in enumerate(points, start=1):
+            lines.append(f"  {i:03d}: ({x:.{precision}f}, {y:.{precision}f}, {z:.{precision}f})")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _extract_ordered_contours_by_slice(
+    rtss_json: dict[str, Any],
+    precision: int = 4,
+) -> dict[float, list[dict[str, Any]]]:
+    """Extract ordered contour polylines grouped by axial slice (z)."""
+    slices: dict[float, list[dict[str, Any]]] = {}
+    roi_contour_seq = rtss_json.get("(3006,0039) ROIContourSequence", [])
+    if not isinstance(roi_contour_seq, list):
+        return slices
+
+    for roi_idx, roi_item in enumerate(roi_contour_seq):
+        if not isinstance(roi_item, dict):
+            continue
+
+        roi_number = roi_item.get("(3006,0084) ReferencedROINumber")
+        if roi_number is None:
+            roi_number = roi_idx
+        roi_name = f"ROI {roi_number}"
+
+        contour_seq = roi_item.get("(3006,0040) ContourSequence", [])
+        if not isinstance(contour_seq, list):
+            continue
+
+        for contour_idx, contour_item in enumerate(contour_seq, start=1):
+            if not isinstance(contour_item, dict):
+                continue
+
+            points = _extract_xyz_points(contour_item.get("(3006,0050) ContourData", []))
+            if not points:
+                continue
+
+            z_mean = sum(p[2] for p in points) / len(points)
+            z_key = round(z_mean, precision)
+            contour_number = contour_item.get("(3006,0048) ContourNumber", contour_idx)
+
+            slices.setdefault(z_key, []).append(
+                {
+                    "roi_name": roi_name,
+                    "contour_label": f"{roi_name} | Contour {contour_number}",
+                    "points": points,
+                }
+            )
+
+    return slices
+
+
+def _add_direction_annotation(
+    fig: go.Figure,
+    points: list[tuple[float, float, float]],
+    color: str,
+    text: str,
+) -> None:
+    if len(points) < 2:
+        return
+    x0, y0, _ = points[0]
+    x1, y1, _ = points[1]
+    fig.add_annotation(
+        x=x1,
+        y=y1,
+        ax=x0,
+        ay=y0,
+        xref="x",
+        yref="y",
+        axref="x",
+        ayref="y",
+        showarrow=True,
+        arrowhead=3,
+        arrowsize=1,
+        arrowwidth=1.6,
+        arrowcolor=color,
+        text=text,
+        font={"size": 11, "color": color},
+        align="left",
+        xanchor="left",
+    )
+
+
+def _add_contour_traces_2d(
+    fig: go.Figure,
+    contours: list[dict[str, Any]],
+    side_name: str,
+    line_color: str,
+    line_dash: str,
+) -> None:
+    for idx, contour in enumerate(contours, start=1):
+        points = contour["points"]
+        if not points:
+            continue
+
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        point_ids = list(range(1, len(points) + 1))
+        contour_name = contour["contour_label"]
+
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines+markers",
+                line={"width": 2, "color": line_color, "dash": line_dash},
+                marker={"size": 5, "color": line_color},
+                name=f"{side_name}: {contour_name}",
+                legendgroup=f"{side_name}_{idx}",
+                hovertemplate=(
+                    f"{side_name}<br>{contour_name}<br>Point %{{customdata}}"
+                    "<br>x=%{x:.3f}<br>y=%{y:.3f}<extra></extra>"
+                ),
+                customdata=point_ids,
+            )
+        )
+
+        first = points[0]
+        last = points[-1]
+        fig.add_trace(
+            go.Scatter(
+                x=[first[0]],
+                y=[first[1]],
+                mode="markers+text",
+                marker={"size": 11, "color": line_color, "symbol": "star"},
+                text=["Start"],
+                textposition="top center",
+                name=f"{side_name} start",
+                legendgroup=f"{side_name}_{idx}",
+                showlegend=False,
+                hovertemplate=(
+                    f"{side_name}<br>{contour_name}<br>Start point (index 1)"
+                    "<br>x=%{x:.3f}<br>y=%{y:.3f}<extra></extra>"
+                ),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[last[0]],
+                y=[last[1]],
+                mode="markers+text",
+                marker={"size": 10, "color": line_color, "symbol": "x"},
+                text=[f"End ({len(points)})"],
+                textposition="bottom center",
+                name=f"{side_name} end",
+                legendgroup=f"{side_name}_{idx}",
+                showlegend=False,
+                hovertemplate=(
+                    f"{side_name}<br>{contour_name}<br>End point (index {len(points)})"
+                    "<br>x=%{x:.3f}<br>y=%{y:.3f}<extra></extra>"
+                ),
+            )
+        )
+
+        _add_direction_annotation(fig, points, line_color, f"{side_name} direction")
+
+
+def render_axial_contour_view(
+    *,
+    left_name: str,
+    right_name: str,
+    left_raw: dict[str, Any],
+    right_raw: dict[str, Any],
+    precision: int = 4,
+) -> None:
+    left_by_slice = _extract_ordered_contours_by_slice(left_raw, precision=precision)
+    right_by_slice = _extract_ordered_contours_by_slice(right_raw, precision=precision)
+    all_slices = sorted(set(left_by_slice.keys()) | set(right_by_slice.keys()))
+
+    if not all_slices:
+        st.warning("No contour data found in either RTSS file.")
+        return
+
+    summary_left = sum(len(v) for v in left_by_slice.values())
+    summary_right = sum(len(v) for v in right_by_slice.values())
+    only_left = [z for z in all_slices if z in left_by_slice and z not in right_by_slice]
+    only_right = [z for z in all_slices if z in right_by_slice and z not in left_by_slice]
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric(f"{left_name} slices", f"{len(left_by_slice):,}")
+    with m2:
+        st.metric(f"{right_name} slices", f"{len(right_by_slice):,}")
+    with m3:
+        st.metric(f"{left_name} contours", f"{summary_left:,}")
+    with m4:
+        st.metric(f"{right_name} contours", f"{summary_right:,}")
+
+    if only_left or only_right:
+        notes: list[str] = []
+        if only_left:
+            notes.append(f"Slices only in {left_name}: {len(only_left)}")
+        if only_right:
+            notes.append(f"Slices only in {right_name}: {len(only_right)}")
+        st.warning(" | ".join(notes))
+    else:
+        st.success("Both files have contours on the same set of axial slice positions.")
+
+    target_z = st.session_state.axial_target_slice_z
+    if target_z is not None:
+        aligned_target = _nearest_slice_value(all_slices, target_z)
+        if aligned_target is not None:
+            st.session_state.axial_slice_select = aligned_target
+        st.session_state.axial_target_slice_z = None
+    elif st.session_state.get("axial_slice_select") not in all_slices:
+        st.session_state.axial_slice_select = all_slices[0]
+
+    nav_col_1, nav_col_2, nav_col_3 = st.columns(3)
+    with nav_col_1:
+        if st.button("Previous Slice", key="axial_prev_slice"):
+            st.session_state.axial_slice_select = _step_slice_value(
+                all_slices,
+                st.session_state.get("axial_slice_select", all_slices[0]),
+                -1,
+            )
+            st.rerun()
+    with nav_col_2:
+        if st.button("Next Slice", key="axial_next_slice"):
+            st.session_state.axial_slice_select = _step_slice_value(
+                all_slices,
+                st.session_state.get("axial_slice_select", all_slices[0]),
+                1,
+            )
+            st.rerun()
+    with nav_col_3:
+        if st.button("Open Contour Detail View", key="axial_open_contour_detail"):
+            current_z = st.session_state.get("axial_slice_select", all_slices[0])
+            st.session_state.contour_detail_target_slice_z = current_z
+            st.session_state.pair_focus_slice_z = current_z
+            st.session_state.pair_step = "Contour Detail View"
+            st.rerun()
+
+    selected_z = st.select_slider(
+        "Axial slice z (mm)",
+        options=all_slices,
+        format_func=lambda z: f"{z:.{precision}f}",
+        value=st.session_state.get("axial_slice_select", all_slices[0]),
+        key="axial_slice_select",
+    )
+    st.session_state.pair_focus_slice_z = selected_z
+
+    left_contours = left_by_slice.get(selected_z, [])
+    right_contours = right_by_slice.get(selected_z, [])
+
+    left_labels = {c["contour_label"] for c in left_contours}
+    right_labels = {c["contour_label"] for c in right_contours}
+    only_left_contours = sorted(left_labels - right_labels)
+    only_right_contours = sorted(right_labels - left_labels)
+
+    if left_contours and not right_contours:
+        st.error(f"Slice z={selected_z:.{precision}f} is present only in {left_name}.")
+    elif right_contours and not left_contours:
+        st.error(f"Slice z={selected_z:.{precision}f} is present only in {right_name}.")
+    else:
+        st.info(
+            f"Slice z={selected_z:.{precision}f} has contours in both files: "
+            f"{len(left_contours)} vs {len(right_contours)}"
+        )
+
+    if only_left_contours or only_right_contours:
+        mismatch_notes: list[str] = []
+        if only_left_contours:
+            mismatch_notes.append(f"Contours only in {left_name}: {len(only_left_contours)}")
+        if only_right_contours:
+            mismatch_notes.append(f"Contours only in {right_name}: {len(only_right_contours)}")
+        st.warning(" | ".join(mismatch_notes))
+
+    fig = go.Figure()
+    if left_contours:
+        _add_contour_traces_2d(
+            fig,
+            contours=left_contours,
+            side_name=left_name,
+            line_color="#d62728",
+            line_dash="solid",
+        )
+    if right_contours:
+        _add_contour_traces_2d(
+            fig,
+            contours=right_contours,
+            side_name=right_name,
+            line_color="#2ca02c",
+            line_dash="dot",
+        )
+
+    if not fig.data:
+        st.info("No contours to display for this slice.")
+        return
+
+    fig.update_layout(
+        title=f"Axial Contour View at z={selected_z:.{precision}f} mm",
+        xaxis_title="X (mm)",
+        yaxis_title="Y (mm)",
+        xaxis={"fixedrange": False},
+        yaxis={"scaleanchor": "x", "scaleratio": 1, "fixedrange": False},
+        dragmode="zoom",
+        margin={"l": 10, "r": 10, "t": 48, "b": 10},
+        legend={"orientation": "h", "y": 1.02, "x": 0},
+    )
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={
+            "scrollZoom": True,
+            "displaylogo": False,
+            "modeBarButtonsToAdd": ["zoom2d", "pan2d", "resetScale2d"],
+        },
+    )
+
+    with st.expander("Slice contour details", expanded=False):
+        left_col, right_col = st.columns(2)
+        with left_col:
+            st.markdown(f"**{left_name}**")
+            if not left_contours:
+                st.caption("No contours on this slice.")
+            else:
+                for c in left_contours:
+                    pts = c["points"]
+                    st.write(
+                        f"{c['contour_label']}: {len(pts)} points | "
+                        f"start=({pts[0][0]:.{precision}f}, {pts[0][1]:.{precision}f}) | "
+                        f"end=({pts[-1][0]:.{precision}f}, {pts[-1][1]:.{precision}f})"
+                    )
+
+
+def render_contour_detail_text_view(
+    *,
+    left_name: str,
+    right_name: str,
+    left_raw: dict[str, Any],
+    right_raw: dict[str, Any],
+    precision: int = 4,
+) -> None:
+    left_contours = select_component(left_raw, "contours")
+    right_contours = select_component(right_raw, "contours")
+    left_slices, right_slices = get_contour_slices_structured(left_contours, right_contours, precision=precision)
+    all_slices = sorted(set(left_slices.keys()) | set(right_slices.keys()))
+
+    if not all_slices:
+        st.warning("No contour data found in either file.")
+        return
+
+    target_z = st.session_state.contour_detail_target_slice_z
+    if target_z is not None:
+        aligned_target = _nearest_slice_value(all_slices, target_z)
+        if aligned_target is not None:
+            st.session_state.contour_detail_slice_select = aligned_target
+        st.session_state.contour_detail_target_slice_z = None
+    elif st.session_state.get("contour_detail_slice_select") not in all_slices:
+        st.session_state.contour_detail_slice_select = all_slices[0]
+
+    nav_col_1, nav_col_2, nav_col_3 = st.columns(3)
+    with nav_col_1:
+        if st.button("Previous Slice", key="detail_prev_slice"):
+            st.session_state.contour_detail_slice_select = _step_slice_value(
+                all_slices,
+                st.session_state.get("contour_detail_slice_select", all_slices[0]),
+                -1,
+            )
+            st.rerun()
+    with nav_col_2:
+        if st.button("Next Slice", key="detail_next_slice"):
+            st.session_state.contour_detail_slice_select = _step_slice_value(
+                all_slices,
+                st.session_state.get("contour_detail_slice_select", all_slices[0]),
+                1,
+            )
+            st.rerun()
+    with nav_col_3:
+        if st.button("Back To Visual Comparison", key="detail_back_to_visual"):
+            current_z = st.session_state.get("contour_detail_slice_select", all_slices[0])
+            st.session_state.axial_target_slice_z = current_z
+            st.session_state.pair_focus_slice_z = current_z
+            st.session_state.pair_step = "Pair Diff"
+            st.session_state.pair_component = "contours"
+            st.session_state.pair_diff_requested = True
+            st.session_state.pair_diff_sig = "force"
+            st.rerun()
+
+    selected_z = st.select_slider(
+        "Contour slice z (mm)",
+        options=all_slices,
+        format_func=lambda z: f"{z:.{precision}f}",
+        value=st.session_state.get("contour_detail_slice_select", all_slices[0]),
+        key="contour_detail_slice_select",
+    )
+    st.session_state.pair_focus_slice_z = selected_z
+
+    left_rois = left_slices.get(selected_z, {})
+    right_rois = right_slices.get(selected_z, {})
+
+    st.markdown(f"### Contour Text Comparison At z={selected_z:.{precision}f}")
+    col_1, col_2 = st.columns(2)
+    with col_1:
+        st.markdown(f"**{left_name}**")
+        st.code(_format_slice_rois_text(left_rois, precision), language="text")
+    with col_2:
+        st.markdown(f"**{right_name}**")
+        st.code(_format_slice_rois_text(right_rois, precision), language="text")
+
+    left_text = _format_slice_rois_text(left_rois, precision)
+    right_text = _format_slice_rois_text(right_rois, precision)
+    diff_text = unified_diff_text(left_text, right_text, left_name, right_name)
+    st.markdown("#### Slice Unified Diff")
+    if diff_text.strip():
+        st.code(diff_text, language="diff")
+    else:
+        st.success("No textual differences on this slice.")
+        with right_col:
+            st.markdown(f"**{right_name}**")
+            if not right_contours:
+                st.caption("No contours on this slice.")
+            else:
+                for c in right_contours:
+                    pts = c["points"]
+                    st.write(
+                        f"{c['contour_label']}: {len(pts)} points | "
+                        f"start=({pts[0][0]:.{precision}f}, {pts[0][1]:.{precision}f}) | "
+                        f"end=({pts[-1][0]:.{precision}f}, {pts[-1][1]:.{precision}f})"
+                    )
 
 
 def render_diff_panel(
@@ -69,9 +604,306 @@ def render_diff_panel(
     if not keep_volatile:
         ignore_prefixes.update(DEFAULT_VOLATILE_TAG_PREFIXES)
 
+    # Get selected components
     left_selected = select_component(left_raw, component)
     right_selected = select_component(right_raw, component)
 
+    # Check if components are identical
+    if left_selected == right_selected:
+        st.info(f"✅ **{component.capitalize()} components are identical** — no differences to compare.")
+        col1, col2 = st.columns(2)
+        with col1:
+            left_json_text = pretty_json_text(left_selected)
+            st.download_button(
+                "Download left JSON",
+                data=left_json_text,
+                file_name=f"{Path(left_name).stem}.{component}.json",
+                mime="application/json",
+                key=f"{key_prefix}_dl_left",
+            )
+        with col2:
+            right_json_text = pretty_json_text(right_selected)
+            st.download_button(
+                "Download right JSON",
+                data=right_json_text,
+                file_name=f"{Path(right_name).stem}.{component}.json",
+                mime="application/json",
+                key=f"{key_prefix}_dl_right",
+            )
+        return
+
+    # Special handling for contour diffing with two-panel layout
+    if component == "contours":
+        left_slices, right_slices = get_contour_slices_structured(left_selected, right_selected, precision=precision)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            left_json_text = pretty_json_text(left_selected)
+            st.download_button(
+                "Download left JSON",
+                data=left_json_text,
+                file_name=f"{Path(left_name).stem}.{component}.json",
+                mime="application/json",
+                key=f"{key_prefix}_dl_left",
+            )
+        with col2:
+            right_json_text = pretty_json_text(right_selected)
+            st.download_button(
+                "Download right JSON",
+                data=right_json_text,
+                file_name=f"{Path(right_name).stem}.{component}.json",
+                mime="application/json",
+                key=f"{key_prefix}_dl_right",
+            )
+        with col3:
+            diff_text = contour_diff_text(left_selected, right_selected, left_name, right_name, precision=precision)
+            st.download_button(
+                "Download contour diff",
+                data=diff_text,
+                file_name=f"{Path(left_name).stem}__{Path(right_name).stem}.{component}.diff",
+                mime="text/plain",
+                key=f"{key_prefix}_dl_diff",
+            )
+
+        st.markdown("### Contour Diff View (by Slice Plane)")
+        st.caption(
+            "Contour points are compared by slice plane (z-coordinate). "
+            "Left panel shows the first file, right panel shows the second file."
+        )
+
+        if not left_slices and not right_slices:
+            st.warning("No contour data found in either file.")
+            return
+
+        global_tolerance = st.slider(
+            "Correspondence tolerance (mm)",
+            min_value=0.1,
+            max_value=10.0,
+            value=1.0,
+            step=0.1,
+            key=f"{key_prefix}_corr_tol",
+        )
+
+        filter_col_1, filter_col_2, filter_col_3, filter_col_4 = st.columns(4)
+        with filter_col_1:
+            hide_identical_slices = st.checkbox(
+                "Hide identical slices",
+                value=False,
+                key=f"{key_prefix}_hide_identical_slices",
+            )
+        with filter_col_2:
+            max_dice_filter = st.slider(
+                "Max dice to include",
+                min_value=0.0,
+                max_value=1.0,
+                value=1.0,
+                step=0.01,
+                key=f"{key_prefix}_max_dice",
+            )
+        with filter_col_3:
+            min_mismatch_filter = st.number_input(
+                "Min mismatch",
+                min_value=0,
+                value=0,
+                step=1,
+                key=f"{key_prefix}_min_mismatch",
+            )
+        with filter_col_4:
+            sort_mode = st.selectbox(
+                "Sort slices",
+                options=[
+                    "Worst dice first",
+                    "Best dice first",
+                    "Highest mismatch first",
+                    "Slice z ascending",
+                    "Slice z descending",
+                ],
+                index=0,
+                key=f"{key_prefix}_slice_sort",
+            )
+
+        # Build slice metrics first, then filter/sort.
+        all_z_coords = sorted(set(left_slices.keys()) | set(right_slices.keys()))
+        slice_rows: list[dict[str, Any]] = []
+        for z in all_z_coords:
+            left_rois = left_slices.get(z, {})
+            right_rois = right_slices.get(z, {})
+            metrics = _slice_match_metrics(left_rois, right_rois, global_tolerance)
+            slice_rows.append(
+                {
+                    "z": z,
+                    "left_rois": left_rois,
+                    "right_rois": right_rois,
+                    "left_count": metrics["left_count"],
+                    "right_count": metrics["right_count"],
+                    "dice": metrics["dice"],
+                    "mismatch_count": metrics["mismatch_count"],
+                    "count_delta": metrics["count_delta"],
+                    "identical_slice": metrics["identical_slice"],
+                    "left_roi_names": metrics["left_roi_names"],
+                    "right_roi_names": metrics["right_roi_names"],
+                    "all_roi_names": metrics["all_roi_names"],
+                }
+            )
+
+        filtered_rows = [
+            row
+            for row in slice_rows
+            if row["dice"] <= max_dice_filter
+            and row["mismatch_count"] >= min_mismatch_filter
+            and (not hide_identical_slices or not row["identical_slice"])
+        ]
+
+        if sort_mode == "Worst dice first":
+            filtered_rows.sort(key=lambda r: (r["dice"], -r["mismatch_count"], r["z"]))
+        elif sort_mode == "Best dice first":
+            filtered_rows.sort(key=lambda r: (-r["dice"], -r["mismatch_count"], r["z"]))
+        elif sort_mode == "Highest mismatch first":
+            filtered_rows.sort(key=lambda r: (-r["mismatch_count"], r["dice"], r["z"]))
+        elif sort_mode == "Slice z descending":
+            filtered_rows.sort(key=lambda r: r["z"], reverse=True)
+        else:
+            filtered_rows.sort(key=lambda r: r["z"])
+
+        st.caption(
+            f"Showing {len(filtered_rows)} / {len(slice_rows)} slices after filters "
+            f"(tolerance={global_tolerance:.1f} mm)."
+        )
+
+        if not filtered_rows:
+            st.info("No slices match the current filters.")
+            return
+
+        focus_slice = _nearest_slice_value(
+            [float(row["z"]) for row in filtered_rows],
+            st.session_state.pair_focus_slice_z,
+        )
+        if focus_slice is not None:
+            st.caption(f"Focused slice: z={focus_slice:.{precision}f}")
+
+        # Render two-panel layout for each filtered slice
+        for row in filtered_rows:
+            z = row["z"]
+            left_rois = row["left_rois"]
+            right_rois = row["right_rois"]
+            left_count = row["left_count"]
+            right_count = row["right_count"]
+            mismatch_count = row["mismatch_count"]
+            count_delta = row["count_delta"]
+            dice = row["dice"]
+            left_roi_names = row["left_roi_names"]
+            right_roi_names = row["right_roi_names"]
+            all_roi_names = row["all_roi_names"]
+            identical_slice = row["identical_slice"]
+
+            header = (
+                f"Slice z={z:.{precision}f} | L={left_count} R={right_count} "
+                f"| delta={count_delta} | mismatch={mismatch_count} | dice={dice:.3f}"
+            )
+
+            expanded = focus_slice is not None and z == focus_slice
+            with st.expander(header, expanded=expanded):
+                if st.button(
+                    "Open This Slice In 2D Axial View",
+                    key=f"{key_prefix}_open_axial_{_safe_key_fragment(f'{z:.{precision}f}')}",
+                ):
+                    st.session_state.axial_target_slice_z = z
+                    st.session_state.pair_focus_slice_z = z
+                    st.session_state.pair_step = "2D Axial Contour View"
+                    st.rerun()
+
+                if identical_slice:
+                    st.caption("✅ This slice is identical in both files")
+
+                # Two-column layout for this slice
+                left_col, right_col = st.columns(2)
+
+                # LEFT PANEL
+                with left_col:
+                    st.markdown(f"**{left_name}**")
+                    if z not in left_slices:
+                        st.caption("❌ No contour data on this slice")
+                    else:
+                        for roi_name in sorted(left_rois.keys()):
+                            points = sorted(left_rois[roi_name])
+                            is_different = roi_name not in right_rois or sorted(right_rois[roi_name]) != points
+                            marker = "⚠️" if is_different else "✓"
+                            st.markdown(f"{marker} *{roi_name}* ({len(points)} points)")
+                            points_text = "\n".join(
+                                [f"({x:.{precision}f}, {y:.{precision}f}, {z:.{precision}f})" for x, y, z in points]
+                            )
+                            st.code(points_text, language="")
+                        
+                        # Show ROIs that only exist in right
+                        for roi_name in sorted(right_roi_names - left_roi_names):
+                            st.markdown(f"⊘ *{roi_name}* (only in {right_name})")
+
+                # RIGHT PANEL
+                with right_col:
+                    st.markdown(f"**{right_name}**")
+                    if z not in right_slices:
+                        st.caption("❌ No contour data on this slice")
+                    else:
+                        for roi_name in sorted(right_rois.keys()):
+                            points = sorted(right_rois[roi_name])
+                            is_different = roi_name not in left_rois or sorted(left_rois[roi_name]) != points
+                            marker = "⚠️" if is_different else "✓"
+                            st.markdown(f"{marker} *{roi_name}* ({len(points)} points)")
+                            points_text = "\n".join(
+                                [f"({x:.{precision}f}, {y:.{precision}f}, {z:.{precision}f})" for x, y, z in points]
+                            )
+                            st.code(points_text, language="")
+                        
+                        # Show ROIs that only exist in left
+                        for roi_name in sorted(left_roi_names - right_roi_names):
+                            st.markdown(f"⊘ *{roi_name}* (only in {left_name})")
+
+                st.markdown("#### Correspondence Explorer")
+                common_rois = sorted(left_roi_names & right_roi_names)
+                if not common_rois:
+                    st.caption("No common ROIs on this slice to match.")
+                else:
+                    z_key = _safe_key_fragment(f"{z:.{precision}f}")
+                    roi_choice = st.selectbox(
+                        "ROI",
+                        options=common_rois,
+                        key=f"{key_prefix}_roi_{z_key}",
+                    )
+                    left_roi_points = sorted(left_rois.get(roi_choice, []))
+                    right_roi_points = sorted(right_rois.get(roi_choice, []))
+                    roi_matches = _greedy_point_matches(left_roi_points, right_roi_points)
+
+                    if not roi_matches:
+                        st.caption("No points available for correspondence on this ROI.")
+                    else:
+                        option_labels: list[str] = []
+                        default_labels: list[str] = []
+                        for li, ri, dist in roi_matches:
+                            label = (
+                                f"L{li + 1} {left_roi_points[li]} <-> "
+                                f"R{ri + 1} {right_roi_points[ri]} | d={dist:.3f}"
+                            )
+                            option_labels.append(label)
+                            if dist <= global_tolerance:
+                                default_labels.append(label)
+
+                        selected_pairs = st.multiselect(
+                            "Select correspondences",
+                            options=option_labels,
+                            default=default_labels,
+                            key=f"{key_prefix}_corr_{z_key}_{_safe_key_fragment(roi_choice)}",
+                        )
+                        st.caption(
+                            f"Auto-suggested correspondences within tolerance: {len(default_labels)} / {len(roi_matches)}"
+                        )
+                        if selected_pairs:
+                            st.code("\n".join(selected_pairs), language="text")
+                        else:
+                            st.caption("No correspondences selected.")
+
+        return
+
+    # Standard text-based diffing for other components
     left_norm = normalize_value(left_selected, precision, ignore_prefixes)
     right_norm = normalize_value(right_selected, precision, ignore_prefixes)
 
@@ -582,7 +1414,7 @@ def main() -> None:
     ensure_state()
 
     st.title("RTSS Diff Viewer")
-    st.caption("Compare RTSS DICOM files using textual diffs and 3D contour overlays.")
+    st.caption("Compare RTSS DICOM files using textual diffs and 2D axial contour overlays.")
 
     app_mode = st.radio(
         "Mode",
@@ -593,16 +1425,20 @@ def main() -> None:
 
     if app_mode == "Instructions":
         st.markdown("### What This App Does")
-        st.write("This app compares RTSS DICOM files using text-based and visual workflows.")
+        st.write("This app compares RTSS DICOM files using intelligent text diffs and 2D axial contour overlays.")
 
         st.markdown("### Pair Mode")
         st.write("Use Pair Mode to compare exactly two RTSS files in detail.")
         st.write("1. Open Pair Mode.")
         st.write("2. In Upload Pair, upload the first and second RTSS .dcm files.")
         st.write("3. Click Convert pair.")
-        st.write("4. Open Pair Diff to review JSON differences by component.")
-        st.write("5. Open 3D Contour View to compare contour points visually.")
-        st.write("6. In 3D view, red points are from the first RTSS and green points are from the second RTSS.")
+        st.write("4. Open Pair Diff to review JSON differences by component:")
+        st.write("   - **metadata**: DICOM package-level tags (fast text diff)")
+        st.write("   - **structures**: ROI structure definitions (text diff)")
+        st.write("   - **references**: Reference frame sequences (text diff)")
+        st.write("   - **contours**: 2D axial visual comparison directly in Pair Diff (fast, slice-by-slice)")
+        st.write("5. Open Contour Detail View to inspect textual point lists and per-slice unified diffs.")
+        st.write("6. Navigation buttons keep the selected slice synchronized between visual and detail views.")
 
         st.markdown("### Batch Compare")
         st.write("Use Batch Compare to compare any two files from a larger uploaded set.")
@@ -610,18 +1446,35 @@ def main() -> None:
         st.write("2. Upload multiple RTSS .dcm files.")
         st.write("3. Click Convert uploaded set.")
         st.write("4. Pick any two variants from the dropdowns.")
-        st.write("5. Review the unified text diff and download outputs if needed.")
+        st.write("5. Select the component to compare (see above for component descriptions).")
+        st.write("6. Review the diff and download outputs if needed.")
+
+        st.markdown("### Component Comparison Details")
+        st.write("**Metadata, Structures, References**: Uses standard unified text diff (fast and simple).")
+        st.write("**Contours**: Uses intelligent slice-plane comparison:")
+        st.write("- Contour points are grouped by slice (z-coordinate)")
+        st.write("- For each slice, differences between ROIs are clearly highlighted")
+        st.write("- Slices-only in one file are clearly marked")
+        st.write("- This approach is much faster and more useful for large RTSS files with hundreds of points")
 
         st.markdown("### Tips")
-        st.write("- Large comparisons automatically switch to unified text diff for faster loading.")
-        st.write("- In 3D view, drag to rotate and scroll to zoom.")
+        st.write("- For RTSS files with many contour points (>50), use the **contours** component in Pair Diff for fast visual review.")
+        st.write("- For metadata changes, use **metadata** to quickly identify DICOM tag differences.")
+        st.write("- In contour visual view, use slider and Previous/Next buttons to move quickly between slices.")
+        st.write("- Large comparisons automatically switch to unified text diff for faster loading (when not using contour mode).")
 
     elif app_mode == "Pair Mode":
-        tab_upload, tab_diff, tab_points_3d = st.tabs(
-            ["1) Upload Pair", "2) Pair Diff", "3) 3D Contour View"]
+        st.markdown("### Pair Mode")
+        step_options = ["Upload Pair", "Pair Diff", "Contour Detail View"]
+        step = st.radio(
+            "Step",
+            options=step_options,
+            index=step_options.index(st.session_state.pair_step),
+            horizontal=True,
         )
+        st.session_state.pair_step = step
 
-        with tab_upload:
+        if step == "Upload Pair":
             st.info("Step 1 of 3: Upload two RTSS files and click Convert pair.")
             left_col, right_col = st.columns(2)
             with left_col:
@@ -638,12 +1491,16 @@ def main() -> None:
                         st.session_state.right_json_raw = dcm_bytes_to_json_dict(right_file.getvalue())
                         st.session_state.left_name = left_file.name
                         st.session_state.right_name = right_file.name
-                    st.success("Pair conversion complete.")
-                    st.info("Next step: open tab 2) Pair Diff to review differences.")
+                    st.session_state.pair_diff_requested = False
+                    st.session_state.pair_diff_sig = None
+                    st.session_state.pair_step = "Pair Diff"
+                    st.rerun()
 
-        with tab_diff:
-            st.info("Step 2 of 3: Review Pair Diff, then move to tab 3) 3D Contour View.")
-            component_options = ["all", "metadata", *COMPONENT_KEYS.keys()]
+        elif step == "Pair Diff":
+            st.info("Step 2 of 3: Choose component and compute diff on demand.")
+            st.markdown("**Select what to compare:**")
+            st.caption("**metadata** compares package-level DICOM tags. **structures** and **references** use text diff. **contours** shows an intelligent slice-by-slice point comparison (recommended for large files).")
+            component_options = ["metadata", "structures", "references", "contours"]
             control_col_1, control_col_2, control_col_3 = st.columns(3)
             with control_col_1:
                 component = st.selectbox("Component", options=component_options, index=0, key="pair_component")
@@ -655,40 +1512,73 @@ def main() -> None:
             left_raw = st.session_state.left_json_raw
             right_raw = st.session_state.right_json_raw
             if left_raw is None or right_raw is None:
-                st.info("Convert a pair in tab 1 first.")
+                st.info("Convert a pair in Upload Pair first.")
             else:
-                st.caption("If files are large, diff generation may take some time while JSON is normalized and compared.")
-                with st.spinner("Preparing normalized JSON and building diff view. This may take time for large files..."):
-                    render_diff_panel(
-                        left_name=st.session_state.left_name,
-                        right_name=st.session_state.right_name,
-                        left_raw=left_raw,
-                        right_raw=right_raw,
-                        component=component,
-                        precision=precision,
-                        keep_volatile=keep_volatile,
-                        allow_rich_view=True,
-                        max_rich_chars=400_000,
-                        max_rich_lines=5_000,
-                        key_prefix="pair",
-                    )
-                st.info("Next step: open tab 3) 3D Contour View for point cloud comparison.")
+                current_sig = (
+                    component,
+                    precision,
+                    keep_volatile,
+                    st.session_state.left_name,
+                    st.session_state.right_name,
+                )
+                compute_clicked = st.button("Compute Pair Diff", type="primary", key="pair_compute_diff")
+                if compute_clicked:
+                    st.session_state.pair_diff_requested = True
+                    st.session_state.pair_diff_sig = current_sig
 
-        with tab_points_3d:
-            st.markdown("### 3D Contour Point Cloud")
-            st.info("Step 3 of 3: Inspect contour points in 3D. Red is first RTSS, green is second RTSS.")
+                pair_diff_sig = st.session_state.pair_diff_sig
+                should_render_diff = (
+                    st.session_state.pair_diff_requested
+                    and (pair_diff_sig == current_sig or pair_diff_sig == "force")
+                )
+
+                if should_render_diff:
+                    if component == "contours":
+                        st.caption("Visual contour comparison is shown directly for faster slice-by-slice review.")
+                        render_axial_contour_view(
+                            left_name=st.session_state.left_name,
+                            right_name=st.session_state.right_name,
+                            left_raw=left_raw,
+                            right_raw=right_raw,
+                            precision=precision,
+                        )
+                    else:
+                        with st.spinner("Computing diff..."):
+                            render_diff_panel(
+                                left_name=st.session_state.left_name,
+                                right_name=st.session_state.right_name,
+                                left_raw=left_raw,
+                                right_raw=right_raw,
+                                component=component,
+                                precision=precision,
+                                keep_volatile=keep_volatile,
+                                allow_rich_view=True,
+                                max_rich_chars=400_000,
+                                max_rich_lines=5_000,
+                                key_prefix="pair",
+                            )
+                    st.session_state.pair_diff_sig = current_sig
+                else:
+                    st.caption("Diff is computed on demand. Click 'Compute Pair Diff' to run comparison.")
+
+        else:
+            st.markdown("### Contour Detail View")
+            st.info(
+                "Step 3 of 3: Inspect textual contour point descriptions on each slice. "
+                "Use this for detailed text-level slice comparison."
+            )
             left_raw = st.session_state.left_json_raw
             right_raw = st.session_state.right_json_raw
             if left_raw is None or right_raw is None:
-                st.info("Convert a pair in tab 1 first.")
+                st.info("Convert a pair in Upload Pair first.")
             else:
-                st.caption("Contour extraction and 3D plot generation can take time for large RTSS files.")
-                with st.spinner("Extracting contour points and rendering interactive 3D view. Please wait..."):
-                    render_contour_point_cloud(
+                with st.spinner("Preparing contour slice text comparison..."):
+                    render_contour_detail_text_view(
                         left_name=st.session_state.left_name,
                         right_name=st.session_state.right_name,
                         left_raw=left_raw,
                         right_raw=right_raw,
+                        precision=4,
                     )
 
     else:
@@ -722,7 +1612,9 @@ def main() -> None:
             if len(names) < 2:
                 st.warning("Need at least two variants.")
             else:
-                component_options = ["all", "metadata", *COMPONENT_KEYS.keys()]
+                st.markdown("**Select what to compare:**")
+                st.caption("**metadata** compares package-level DICOM tags. **structures** and **references** use text diff. **contours** shows an intelligent slice-by-slice point comparison (recommended for large files).")
+                component_options = ["metadata", "structures", "references", "contours"]
                 control_col_1, control_col_2, control_col_3 = st.columns(3)
                 with control_col_1:
                     component = st.selectbox("Component", options=component_options, index=0, key="batch_component")

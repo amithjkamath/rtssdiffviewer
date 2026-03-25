@@ -8,8 +8,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app import (
+    _format_slice_rois_text,
+    _greedy_point_matches,
+    _extract_ordered_contours_by_slice,
     _extract_volume_bounds_from_rtss,
     _merge_bounds,
+    _nearest_slice_value,
+    _safe_key_fragment,
+    _slice_match_metrics,
+    _step_slice_value,
     extract_contour_points,
     should_use_unified_only,
 )
@@ -160,3 +167,132 @@ def test_merge_bounds() -> None:
         "z_min": 3.0,
         "z_max": 6.0,
     }
+
+
+def test_greedy_point_matches_unique_pairs() -> None:
+    left = [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0)]
+    right = [(0.2, 0.0, 0.0), (9.8, 0.0, 0.0)]
+
+    matches = _greedy_point_matches(left, right)
+
+    assert len(matches) == 2
+    assert {m[0] for m in matches} == {0, 1}
+    assert {m[1] for m in matches} == {0, 1}
+
+
+def test_slice_match_metrics_dice_and_mismatch() -> None:
+    left_rois = {
+        "ROI 1": [
+            (0.0, 0.0, 1.0),
+            (10.0, 0.0, 1.0),
+        ]
+    }
+    right_rois = {
+        "ROI 1": [
+            (0.2, 0.0, 1.0),
+            (11.5, 0.0, 1.0),
+        ]
+    }
+
+    metrics = _slice_match_metrics(left_rois, right_rois, tolerance_mm=1.0)
+
+    assert metrics["left_count"] == 2
+    assert metrics["right_count"] == 2
+    assert metrics["mismatch_count"] == 2
+    assert metrics["count_delta"] == 0
+    assert metrics["dice"] == 0.5
+    assert metrics["identical_slice"] is False
+
+
+def test_slice_match_metrics_identical_slice() -> None:
+    rois = {
+        "ROI 1": [
+            (1.0, 2.0, 3.0),
+            (4.0, 5.0, 3.0),
+        ]
+    }
+
+    metrics = _slice_match_metrics(rois, rois, tolerance_mm=0.1)
+
+    assert metrics["identical_slice"] is True
+    assert metrics["mismatch_count"] == 0
+    assert metrics["dice"] == 1.0
+
+
+def test_safe_key_fragment_replaces_non_alnum() -> None:
+    assert _safe_key_fragment("z=12.5/ROI 1") == "z_12_5_ROI_1"
+
+
+def test_nearest_slice_value_selects_closest() -> None:
+    slices = [1.0, 2.5, 5.0]
+
+    assert _nearest_slice_value(slices, 2.7) == 2.5
+    assert _nearest_slice_value(slices, None) == 1.0
+
+
+def test_nearest_slice_value_returns_none_for_empty() -> None:
+    assert _nearest_slice_value([], 10.0) is None
+
+
+def test_extract_ordered_contours_by_slice_preserves_point_order() -> None:
+    sample = {
+        "(3006,0039) ROIContourSequence": [
+            {
+                "(3006,0084) ReferencedROINumber": 7,
+                "(3006,0040) ContourSequence": [
+                    {
+                        "(3006,0048) ContourNumber": 3,
+                        "(3006,0050) ContourData": [
+                            [10.0, 5.0, 1.0001],
+                            [11.0, 6.0, 1.0001],
+                            [12.0, 7.0, 1.0001],
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+    slices = _extract_ordered_contours_by_slice(sample, precision=3)
+
+    assert list(slices.keys()) == [1.0]
+    assert len(slices[1.0]) == 1
+    contour = slices[1.0][0]
+    assert contour["contour_label"] == "ROI 7 | Contour 3"
+    assert contour["points"] == [
+        (10.0, 5.0, 1.0001),
+        (11.0, 6.0, 1.0001),
+        (12.0, 7.0, 1.0001),
+    ]
+
+
+def test_step_slice_value_bounds_and_steps() -> None:
+    slices = [1.0, 2.0, 3.0]
+
+    assert _step_slice_value(slices, 2.0, -1) == 1.0
+    assert _step_slice_value(slices, 2.0, 1) == 3.0
+    assert _step_slice_value(slices, 1.0, -1) == 1.0
+    assert _step_slice_value(slices, 3.0, 1) == 3.0
+
+
+def test_step_slice_value_handles_missing_current() -> None:
+    slices = [1.0, 2.0, 3.0]
+    assert _step_slice_value(slices, 99.0, 1) == 2.0
+
+
+def test_format_slice_rois_text_includes_index_and_order() -> None:
+    rois = {
+        "ROI 2": [(2.0, 2.0, 5.0)],
+        "ROI 1": [(1.0, 1.0, 5.0), (3.0, 3.0, 5.0)],
+    }
+
+    text = _format_slice_rois_text(rois, precision=2)
+
+    assert "ROI 1: 2 points" in text
+    assert "001: (1.00, 1.00, 5.00)" in text
+    assert "002: (3.00, 3.00, 5.00)" in text
+    assert "ROI 2: 1 points" in text
+
+
+def test_format_slice_rois_text_empty() -> None:
+    assert _format_slice_rois_text({}, precision=4) == "(no contours on this slice)"
