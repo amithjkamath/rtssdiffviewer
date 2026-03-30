@@ -389,12 +389,11 @@ def render_axial_contour_view(
             )
             st.rerun()
     with nav_col_3:
-        if st.button("Open Contour Detail View", key="axial_open_contour_detail"):
+        if st.button("Sync To Contour Detail", key="axial_open_contour_detail"):
             current_z = st.session_state.get("axial_slice_select", all_slices[0])
             st.session_state.contour_detail_target_slice_z = current_z
             st.session_state.pair_focus_slice_z = current_z
-            st.session_state.pair_step = "Contour Detail View"
-            st.rerun()
+            st.info(f"Slice z={current_z} synced. Switch to the Contour Detail tab.")
 
     selected_z = st.select_slider(
         "Axial slice z (mm)",
@@ -533,14 +532,14 @@ def render_contour_detail_text_view(
             )
             st.rerun()
     with nav_col_3:
-        if st.button("Back To Visual Comparison", key="detail_back_to_visual"):
+        if st.button("Sync To Visual Comparison", key="detail_back_to_visual"):
             current_z = st.session_state.get("contour_detail_slice_select", all_slices[0])
             st.session_state.axial_target_slice_z = current_z
             st.session_state.pair_focus_slice_z = current_z
-            st.session_state.pair_step = "Pair Diff"
             st.session_state.pair_component = "contours"
             st.session_state.pair_diff_requested = True
             st.session_state.pair_diff_sig = "force"
+            st.info(f"Slice z={current_z} synced. Switch to the Diff tab.")
             st.rerun()
 
     selected_z = st.select_slider(
@@ -572,18 +571,6 @@ def render_contour_detail_text_view(
         st.code(diff_text, language="diff")
     else:
         st.success("No textual differences on this slice.")
-        with right_col:
-            st.markdown(f"**{right_name}**")
-            if not right_contours:
-                st.caption("No contours on this slice.")
-            else:
-                for c in right_contours:
-                    pts = c["points"]
-                    st.write(
-                        f"{c['contour_label']}: {len(pts)} points | "
-                        f"start=({pts[0][0]:.{precision}f}, {pts[0][1]:.{precision}f}) | "
-                        f"end=({pts[-1][0]:.{precision}f}, {pts[-1][1]:.{precision}f})"
-                    )
 
 
 def render_diff_panel(
@@ -610,7 +597,7 @@ def render_diff_panel(
 
     # Check if components are identical
     if left_selected == right_selected:
-        st.info(f"✅ **{component.capitalize()} components are identical** — no differences to compare.")
+        st.info(f"**{component.capitalize()} components are identical** — no differences to compare.")
         col1, col2 = st.columns(2)
         with col1:
             left_json_text = pretty_json_text(left_selected)
@@ -809,11 +796,9 @@ def render_diff_panel(
                 ):
                     st.session_state.axial_target_slice_z = z
                     st.session_state.pair_focus_slice_z = z
-                    st.session_state.pair_step = "2D Axial Contour View"
-                    st.rerun()
 
                 if identical_slice:
-                    st.caption("✅ This slice is identical in both files")
+                    st.caption("This slice is identical in both files.")
 
                 # Two-column layout for this slice
                 left_col, right_col = st.columns(2)
@@ -822,12 +807,12 @@ def render_diff_panel(
                 with left_col:
                     st.markdown(f"**{left_name}**")
                     if z not in left_slices:
-                        st.caption("❌ No contour data on this slice")
+                        st.caption("No contour data on this slice.")
                     else:
                         for roi_name in sorted(left_rois.keys()):
                             points = sorted(left_rois[roi_name])
                             is_different = roi_name not in right_rois or sorted(right_rois[roi_name]) != points
-                            marker = "⚠️" if is_different else "✓"
+                            marker = "[diff]" if is_different else "[same]"
                             st.markdown(f"{marker} *{roi_name}* ({len(points)} points)")
                             points_text = "\n".join(
                                 [f"({x:.{precision}f}, {y:.{precision}f}, {z:.{precision}f})" for x, y, z in points]
@@ -842,12 +827,12 @@ def render_diff_panel(
                 with right_col:
                     st.markdown(f"**{right_name}**")
                     if z not in right_slices:
-                        st.caption("❌ No contour data on this slice")
+                        st.caption("No contour data on this slice.")
                     else:
                         for roi_name in sorted(right_rois.keys()):
                             points = sorted(right_rois[roi_name])
                             is_different = roi_name not in left_rois or sorted(left_rois[roi_name]) != points
-                            marker = "⚠️" if is_different else "✓"
+                            marker = "[diff]" if is_different else "[same]"
                             st.markdown(f"{marker} *{roi_name}* ({len(points)} points)")
                             points_text = "\n".join(
                                 [f"({x:.{precision}f}, {y:.{precision}f}, {z:.{precision}f})" for x, y, z in points]
@@ -1413,78 +1398,155 @@ def main() -> None:
     st.set_page_config(page_title="RTSS Diff Viewer", layout="wide")
     ensure_state()
 
-    st.title("RTSS Diff Viewer")
-    st.caption("Compare RTSS DICOM files using textual diffs and 2D axial contour overlays.")
+    # ------------------------------------------------------------------ Sidebar
+    with st.sidebar:
+        st.markdown("## RTSS Diff Viewer")
+        st.caption("Compare RTSS DICOM files using textual diffs and 2D axial contour overlays.")
+        st.divider()
 
-    app_mode = st.radio(
-        "Mode",
-        options=["Instructions", "Pair Mode", "Batch Compare"],
-        index=0,
-        horizontal=True,
-    )
-
-    if app_mode == "Instructions":
-        st.markdown("### What This App Does")
-        st.write("This app compares RTSS DICOM files using intelligent text diffs and 2D axial contour overlays.")
-
-        st.markdown("### Pair Mode")
-        st.write("Use Pair Mode to compare exactly two RTSS files in detail.")
-        st.write("1. Open Pair Mode.")
-        st.write("2. In Upload Pair, upload the first and second RTSS .dcm files.")
-        st.write("3. Click Convert pair.")
-        st.write("4. Open Pair Diff to review JSON differences by component:")
-        st.write("   - **metadata**: DICOM package-level tags (fast text diff)")
-        st.write("   - **structures**: ROI structure definitions (text diff)")
-        st.write("   - **references**: Reference frame sequences (text diff)")
-        st.write("   - **contours**: 2D axial visual comparison directly in Pair Diff (fast, slice-by-slice)")
-        st.write("5. Open Contour Detail View to inspect textual point lists and per-slice unified diffs.")
-        st.write("6. Navigation buttons keep the selected slice synchronized between visual and detail views.")
-
-        st.markdown("### Batch Compare")
-        st.write("Use Batch Compare to compare any two files from a larger uploaded set.")
-        st.write("1. Open Batch Compare.")
-        st.write("2. Upload multiple RTSS .dcm files.")
-        st.write("3. Click Convert uploaded set.")
-        st.write("4. Pick any two variants from the dropdowns.")
-        st.write("5. Select the component to compare (see above for component descriptions).")
-        st.write("6. Review the diff and download outputs if needed.")
-
-        st.markdown("### Component Comparison Details")
-        st.write("**Metadata, Structures, References**: Uses standard unified text diff (fast and simple).")
-        st.write("**Contours**: Uses intelligent slice-plane comparison:")
-        st.write("- Contour points are grouped by slice (z-coordinate)")
-        st.write("- For each slice, differences between ROIs are clearly highlighted")
-        st.write("- Slices-only in one file are clearly marked")
-        st.write("- This approach is much faster and more useful for large RTSS files with hundreds of points")
-
-        st.markdown("### Tips")
-        st.write("- For RTSS files with many contour points (>50), use the **contours** component in Pair Diff for fast visual review.")
-        st.write("- For metadata changes, use **metadata** to quickly identify DICOM tag differences.")
-        st.write("- In contour visual view, use slider and Previous/Next buttons to move quickly between slices.")
-        st.write("- Large comparisons automatically switch to unified text diff for faster loading (when not using contour mode).")
-
-    elif app_mode == "Pair Mode":
-        st.markdown("### Pair Mode")
-        step_options = ["Upload Pair", "Pair Diff", "Contour Detail View"]
-        step = st.radio(
-            "Step",
-            options=step_options,
-            index=step_options.index(st.session_state.pair_step),
-            horizontal=True,
+        app_mode = st.radio(
+            "View",
+            options=["Instructions", "Pair Mode", "Batch Compare"],
+            label_visibility="collapsed",
         )
-        st.session_state.pair_step = step
 
-        if step == "Upload Pair":
-            st.info("Step 1 of 3: Upload two RTSS files and click Convert pair.")
+        if app_mode != "Instructions":
+            st.divider()
+            st.markdown("**Settings**")
+            mode_prefix = "pair" if app_mode == "Pair Mode" else "batch"
+            precision = st.slider(
+                "Float precision",
+                min_value=2,
+                max_value=10,
+                value=6,
+                key=f"{mode_prefix}_precision",
+                help="Number of decimal places shown for contour point coordinates.",
+            )
+            keep_volatile = st.checkbox(
+                "Keep volatile tags",
+                value=False,
+                key=f"{mode_prefix}_keep_volatile",
+                help=(
+                    "When off, UID and timestamp tags that change on every export "
+                    "are excluded from the metadata diff."
+                ),
+            )
+
+    # -------------------------------------------------------- Instructions view
+    if app_mode == "Instructions":
+        st.markdown("## Quick-Start Guide")
+        st.info(
+            "This tool compares two RTSS DICOM files side-by-side. "
+            "It breaks each file into four components — **metadata**, **structures**, **references**, and **contours** — "
+            "and shows exactly what changed between them."
+        )
+
+        st.markdown("---")
+        st.markdown("### Modes at a Glance")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown(
+                "#### Pair Mode\n"
+                "Compare exactly **two** RTSS files in full detail.\n\n"
+                "Best for: reviewing a before/after pair, checking a re-plan, "
+                "or validating an export against a reference."
+            )
+        with col_b:
+            st.markdown(
+                "#### Batch Compare\n"
+                "Upload **many** files at once and pick any two to compare.\n\n"
+                "Best for: screening a set of variants, comparing multiple "
+                "plan versions, or running QA across a cohort."
+            )
+
+        st.markdown("---")
+        st.markdown("### Pair Mode — Step by Step")
+        st.markdown(
+            "**1. Upload tab**\n"
+            "- Upload the *Left* (reference) and *Right* (modified) RTSS `.dcm` files.\n"
+            "- Click **Convert pair** — the files are parsed once and cached for the session.\n\n"
+            "**2. Diff tab — choose a component**\n\n"
+            "| Component | What it contains | Diff method |\n"
+            "|-----------|-----------------|-------------|\n"
+            "| `metadata` | DICOM package-level tags (e.g. SOP UID, study date) | Unified text diff |\n"
+            "| `structures` | ROI names, numbers, and type codes | Unified text diff |\n"
+            "| `references` | Referenced frame-of-reference sequences | Unified text diff |\n"
+            "| `contours` | 2D point lists grouped by axial slice (z-plane) | Visual overlay + per-slice diff |\n\n"
+            "For **metadata / structures / references**: a red/green unified diff is shown immediately. "
+            "Identical components show a confirmation banner.\n\n"
+            "For **contours**: an axial overlay canvas renders both files' contours in the same colour scheme. "
+            "Use the z-slice slider or Previous / Next buttons to step through slices. "
+            "Click **Sync To Contour Detail** on any slice to sync the selected slice to the Contour Detail tab.\n\n"
+            "**3. Contour Detail tab**\n"
+            "- Shows the raw point list for the selected slice in both files, side-by-side.\n"
+            "- A unified diff below highlights added/removed points precisely.\n"
+            "- Use **Previous Slice / Next Slice** to walk through changes.\n"
+            "- **Sync To Visual Comparison** syncs the slice back to the Diff tab.\n\n"
+            "**4. Downloads**\n"
+            "- On any diff panel, use the **Download left JSON** / **Download right JSON** buttons "
+            "to export the parsed component for offline inspection."
+        )
+
+        st.markdown("---")
+        st.markdown("### Batch Compare — Step by Step")
+        st.markdown(
+            "1. In the Upload tab, upload all RTSS `.dcm` files you want to screen.\n"
+            "2. Click **Convert uploaded set** — each file is parsed once.\n"
+            "3. In the Compare tab, choose a **Left** and **Right** file from the dropdowns.\n"
+            "4. Select the **component** to compare (same four options as Pair Mode).\n"
+            "5. Review the diff or visual overlay; download JSON outputs if needed.\n\n"
+            "> **Note:** Batch Compare does not include a Contour Detail view. "
+            "For detailed point-level inspection, load the two files of interest in Pair Mode."
+        )
+
+        st.markdown("---")
+        st.markdown("### Settings")
+        st.markdown(
+            "Settings are available in the sidebar when Pair Mode or Batch Compare is active.\n\n"
+            "**Float precision** — controls how many decimal places are shown for contour "
+            "point coordinates. Higher precision reveals sub-millimetre differences; lower precision "
+            "reduces noise from floating-point rounding.\n\n"
+            "**Keep volatile tags** — when off (default), tags that change on every export "
+            "(e.g. SOP Instance UID, timestamps) are stripped before diffing so they do not clutter "
+            "the metadata diff. Enable to include every tag."
+        )
+
+        st.markdown("---")
+        st.markdown("### Common Workflows")
+        st.markdown(
+            "**Checking whether a re-export changed anything meaningful**\n"
+            "1. Pair Mode — upload original (Left) and re-export (Right).\n"
+            "2. Check `metadata` with *Keep volatile tags* off — expect no diff.\n"
+            "3. Check `structures` and `references` — expect no diff.\n"
+            "4. Check `contours` — step through slices; diverging overlays indicate geometric change.\n\n"
+            "**Finding which slice changed after a re-plan**\n"
+            "1. Pair Mode — upload pre-plan (Left) and post-plan (Right).\n"
+            "2. In the Diff tab select `contours`; step through slices until the overlay diverges.\n"
+            "3. Click **Sync To Contour Detail** and switch to the Contour Detail tab.\n\n"
+            "**Screening many files quickly**\n"
+            "1. Batch Compare — upload all variants.\n"
+            "2. For each pair of interest, select `structures` first — if ROI names differ, "
+            "contour comparison may not be meaningful.\n"
+            "3. Then compare `contours` for geometric QA."
+        )
+
+    # ------------------------------------------------------------- Pair Mode
+    elif app_mode == "Pair Mode":
+        st.markdown("## Pair Mode")
+        tab_upload, tab_diff, tab_detail = st.tabs(["Upload", "Diff", "Contour Detail"])
+
+        with tab_upload:
             left_col, right_col = st.columns(2)
             with left_col:
                 left_file = st.file_uploader("Left RTSS (.dcm)", type=["dcm"], key="left_pair")
             with right_col:
                 right_file = st.file_uploader("Right RTSS (.dcm)", type=["dcm"], key="right_pair")
 
+            st.divider()
             if st.button("Convert pair", type="primary"):
                 if left_file is None or right_file is None:
-                    st.warning("Upload both files first.")
+                    st.warning("Upload both files before converting.")
                 else:
                     with st.spinner("Converting files..."):
                         st.session_state.left_json_raw = dcm_bytes_to_json_dict(left_file.getvalue())
@@ -1493,27 +1555,32 @@ def main() -> None:
                         st.session_state.right_name = right_file.name
                     st.session_state.pair_diff_requested = False
                     st.session_state.pair_diff_sig = None
-                    st.session_state.pair_step = "Pair Diff"
-                    st.rerun()
+                    st.success("Files converted. Switch to the Diff tab to compare.")
 
-        elif step == "Pair Diff":
-            st.info("Step 2 of 3: Choose component and compute diff on demand.")
-            st.markdown("**Select what to compare:**")
-            st.caption("**metadata** compares package-level DICOM tags. **structures** and **references** use text diff. **contours** shows an intelligent slice-by-slice point comparison (recommended for large files).")
-            component_options = ["metadata", "structures", "references", "contours"]
-            control_col_1, control_col_2, control_col_3 = st.columns(3)
-            with control_col_1:
-                component = st.selectbox("Component", options=component_options, index=0, key="pair_component")
-            with control_col_2:
-                precision = st.slider("Float precision", min_value=2, max_value=10, value=6, key="pair_precision")
-            with control_col_3:
-                keep_volatile = st.checkbox("Keep volatile UID/time tags", value=False, key="pair_keep_volatile")
+            if st.session_state.left_json_raw is not None:
+                st.info(
+                    f"Loaded: **{st.session_state.left_name}** (left) "
+                    f"and **{st.session_state.right_name}** (right)."
+                )
 
+        with tab_diff:
             left_raw = st.session_state.left_json_raw
             right_raw = st.session_state.right_json_raw
             if left_raw is None or right_raw is None:
-                st.info("Convert a pair in Upload Pair first.")
+                st.info("Upload and convert a pair of files in the Upload tab first.")
             else:
+                component_options = ["metadata", "structures", "references", "contours"]
+                col_comp, col_btn2 = st.columns([3, 1])
+                with col_comp:
+                    component = st.selectbox(
+                        "Component",
+                        options=component_options,
+                        key="pair_component",
+                    )
+                with col_btn2:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    compute_clicked = st.button("Compute Diff", type="primary", key="pair_compute_diff")
+
                 current_sig = (
                     component,
                     precision,
@@ -1521,20 +1588,17 @@ def main() -> None:
                     st.session_state.left_name,
                     st.session_state.right_name,
                 )
-                compute_clicked = st.button("Compute Pair Diff", type="primary", key="pair_compute_diff")
                 if compute_clicked:
                     st.session_state.pair_diff_requested = True
                     st.session_state.pair_diff_sig = current_sig
 
                 pair_diff_sig = st.session_state.pair_diff_sig
-                should_render_diff = (
-                    st.session_state.pair_diff_requested
-                    and (pair_diff_sig == current_sig or pair_diff_sig == "force")
+                should_render_diff = st.session_state.pair_diff_requested and (
+                    pair_diff_sig == current_sig or pair_diff_sig == "force"
                 )
 
                 if should_render_diff:
                     if component == "contours":
-                        st.caption("Visual contour comparison is shown directly for faster slice-by-slice review.")
                         render_axial_contour_view(
                             left_name=st.session_state.left_name,
                             right_name=st.session_state.right_name,
@@ -1559,18 +1623,13 @@ def main() -> None:
                             )
                     st.session_state.pair_diff_sig = current_sig
                 else:
-                    st.caption("Diff is computed on demand. Click 'Compute Pair Diff' to run comparison.")
+                    st.caption("Select a component and click Compute Diff to run the comparison.")
 
-        else:
-            st.markdown("### Contour Detail View")
-            st.info(
-                "Step 3 of 3: Inspect textual contour point descriptions on each slice. "
-                "Use this for detailed text-level slice comparison."
-            )
+        with tab_detail:
             left_raw = st.session_state.left_json_raw
             right_raw = st.session_state.right_json_raw
             if left_raw is None or right_raw is None:
-                st.info("Convert a pair in Upload Pair first.")
+                st.info("Upload and convert a pair of files in the Upload tab first.")
             else:
                 with st.spinner("Preparing contour slice text comparison..."):
                     render_contour_detail_text_view(
@@ -1578,73 +1637,82 @@ def main() -> None:
                         right_name=st.session_state.right_name,
                         left_raw=left_raw,
                         right_raw=right_raw,
-                        precision=4,
-                    )
-
-    else:
-        st.markdown("### Batch Compare")
-        files = st.file_uploader(
-            "Upload RTSS variant set (.dcm)",
-            type=["dcm"],
-            accept_multiple_files=True,
-            key="batch_upload",
-        )
-
-        if st.button("Convert uploaded set", type="primary", key="batch_convert"):
-            if not files:
-                st.warning("Upload at least two RTSS files.")
-            else:
-                converted: dict[str, dict[str, Any]] = {}
-                with st.spinner("Converting variant set..."):
-                    for idx, file in enumerate(files, start=1):
-                        name = file.name
-                        if name in converted:
-                            name = f"{idx:02d}_{name}"
-                        converted[name] = dcm_bytes_to_json_dict(file.getvalue())
-                st.session_state.batch_variants = converted
-                st.success(f"Converted {len(converted)} file(s).")
-
-        variants = st.session_state.batch_variants
-        if not variants:
-            st.info("No batch set loaded yet.")
-        else:
-            names = sorted(variants.keys())
-            if len(names) < 2:
-                st.warning("Need at least two variants.")
-            else:
-                st.markdown("**Select what to compare:**")
-                st.caption("**metadata** compares package-level DICOM tags. **structures** and **references** use text diff. **contours** shows an intelligent slice-by-slice point comparison (recommended for large files).")
-                component_options = ["metadata", "structures", "references", "contours"]
-                control_col_1, control_col_2, control_col_3 = st.columns(3)
-                with control_col_1:
-                    component = st.selectbox("Component", options=component_options, index=0, key="batch_component")
-                with control_col_2:
-                    precision = st.slider("Float precision", min_value=2, max_value=10, value=6, key="batch_precision")
-                with control_col_3:
-                    keep_volatile = st.checkbox("Keep volatile UID/time tags", value=False, key="batch_keep_volatile")
-
-                left_col, right_col = st.columns(2)
-                with left_col:
-                    left_name = st.selectbox("Left variant", names, index=0, key="batch_left")
-                with right_col:
-                    right_name = st.selectbox("Right variant", names, index=1, key="batch_right")
-
-                if left_name == right_name:
-                    st.warning("Select two different variants.")
-                else:
-                    render_diff_panel(
-                        left_name=left_name,
-                        right_name=right_name,
-                        left_raw=variants[left_name],
-                        right_raw=variants[right_name],
-                        component=component,
                         precision=precision,
-                        keep_volatile=keep_volatile,
-                        allow_rich_view=False,
-                        max_rich_chars=0,
-                        max_rich_lines=0,
-                        key_prefix="batch",
                     )
+
+    # --------------------------------------------------------- Batch Compare
+    else:
+        st.markdown("## Batch Compare")
+        tab_upload, tab_compare = st.tabs(["Upload", "Compare"])
+
+        with tab_upload:
+            files = st.file_uploader(
+                "Upload RTSS variant set (.dcm)",
+                type=["dcm"],
+                accept_multiple_files=True,
+                key="batch_upload",
+            )
+            st.divider()
+            if st.button("Convert uploaded set", type="primary", key="batch_convert"):
+                if not files:
+                    st.warning("Upload at least two RTSS files.")
+                else:
+                    converted: dict[str, dict[str, Any]] = {}
+                    with st.spinner("Converting variant set..."):
+                        for idx, file in enumerate(files, start=1):
+                            name = file.name
+                            if name in converted:
+                                name = f"{idx:02d}_{name}"
+                            converted[name] = dcm_bytes_to_json_dict(file.getvalue())
+                    st.session_state.batch_variants = converted
+                    st.success(f"Converted {len(converted)} file(s). Switch to the Compare tab.")
+
+            if st.session_state.batch_variants:
+                st.info(f"{len(st.session_state.batch_variants)} file(s) loaded.")
+
+        with tab_compare:
+            variants = st.session_state.batch_variants
+            if not variants:
+                st.info("Upload and convert files in the Upload tab first.")
+            else:
+                names = sorted(variants.keys())
+                if len(names) < 2:
+                    st.warning("Need at least two variants.")
+                else:
+                    col_left, col_right, col_comp = st.columns(3)
+                    with col_left:
+                        left_name = st.selectbox("Left variant", names, index=0, key="batch_left")
+                    with col_right:
+                        right_name = st.selectbox(
+                            "Right variant",
+                            names,
+                            index=min(1, len(names) - 1),
+                            key="batch_right",
+                        )
+                    with col_comp:
+                        component = st.selectbox(
+                            "Component",
+                            options=["metadata", "structures", "references", "contours"],
+                            index=0,
+                            key="batch_component",
+                        )
+
+                    if left_name == right_name:
+                        st.warning("Select two different variants.")
+                    else:
+                        render_diff_panel(
+                            left_name=left_name,
+                            right_name=right_name,
+                            left_raw=variants[left_name],
+                            right_raw=variants[right_name],
+                            component=component,
+                            precision=precision,
+                            keep_volatile=keep_volatile,
+                            allow_rich_view=False,
+                            max_rich_chars=0,
+                            max_rich_lines=0,
+                            key_prefix="batch",
+                        )
 
 
 if __name__ == "__main__":
